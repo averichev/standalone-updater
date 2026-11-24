@@ -379,12 +379,14 @@ impl UpdateManager {
         Ok(job)
     }
 
-    /// Begin installation of an already prepared operation. No release-server
-    /// request is made. Signals shutdown only after the supervisor/worker is ready.
+    /// Begin background installation of an already prepared operation. No
+    /// release-server request is made. The returned snapshot precedes handoff;
+    /// request cancellation cannot stop the detached installation task. Signals
+    /// shutdown only after the supervisor/worker is ready.
     /// Repeated calls for the same stopping/completed operation return its status.
     pub async fn install(&self, id: &str) -> Result<OperationStatus> {
         let store = &self.0.store;
-        let _operation = store.lock("operation.lock")?;
+        let operation = store.lock("operation.lock")?;
         let mut status = store.status()?;
         if status.operation_id.as_deref() != Some(id) || status.recovery_required {
             return Err(UpdateError::Stale);
@@ -405,22 +407,28 @@ impl UpdateManager {
             .map_err(|_| UpdateError::Worker)?
             .take()
             .ok_or(UpdateError::Stale)?;
-        if let Err(error) = self.begin_handoff(&job, &mut status).await {
-            // A worker can persist a more precise redacted failure before exiting.
-            // Do not replace that evidence with a generic handshake error.
-            if let Ok(failed) = store.status()
-                && failed.operation_id == status.operation_id
-                && failed.state == Stage::Failed
-            {
-                status = failed;
-            } else {
-                mark_failed(&mut status, &error);
+        let initial = status.clone();
+        let manager = self.clone();
+        // Request cancellation must not drop a partially started worker's pipe
+        // or lose the only in-memory prepared job. The operation owns its task.
+        tokio::spawn(async move {
+            let _operation = operation;
+            let store = &manager.0.store;
+            if let Err(error) = manager.begin_handoff(&job, &mut status).await {
+                // Preserve the worker's more precise redacted failure.
+                if let Ok(failed) = store.status()
+                    && failed.operation_id == status.operation_id
+                    && failed.state == Stage::Failed
+                {
+                    status = failed;
+                } else {
+                    mark_failed(&mut status, &error);
+                }
+                status.worker = None;
+                let _ = store.save_status(&mut status);
             }
-            status.worker = None;
-            store.save_status(&mut status)?;
-            return Err(error);
-        }
-        Ok(status)
+        });
+        Ok(initial)
     }
 
     /// Discard a prepared candidate before shutdown. A fresh check is needed to

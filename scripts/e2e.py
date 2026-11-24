@@ -336,6 +336,28 @@ def run_cases(fixtures):
             report.append(name)
 
         try:
+            source.select()
+            instance = app("standalone")
+            try:
+                operation = instance.prepare()
+                source.stop()
+                body = json.dumps(dict(operation_id=operation)).encode()
+                request = (f"POST /update/install HTTP/1.1\r\nHost: 127.0.0.1:{instance.port}\r\n"
+                           f"Authorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\n"
+                           f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode() + body
+                with socket.create_connection(("127.0.0.1", instance.port), timeout=3) as connection:
+                    connection.sendall(request)
+                    # Prove the handler has begun handoff, then disappear without
+                    # reading its response. Its task must retain the prepared job.
+                    eventually(lambda: (instance.updates / "staging" / ("worker-" + operation)).exists()
+                               or instance.durable()["state"] in {"stopping", "switching", "starting", "health_check", "completed"})
+                assert instance.wait_stage("completed")["current_version"] == "0.6.0"
+                assert digest(instance.binary) == digest(fixtures / "good")
+                instance.preserved()
+                passed("standalone: disconnected install client cannot cancel background handoff")
+            finally:
+                instance.close()
+
             for mode in ["standalone", "supervisor"]:
                 source.select()
                 instance = app(mode)

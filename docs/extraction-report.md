@@ -56,7 +56,7 @@ graceful drain/закрытие ресурсов приложением → fini
   RustSec database: 1566 advisories, commit
   `1d328b6bb9f2f350bf65c1c81ab68781cb9e018a`.
 
-`scripts/e2e.py` проходит **20 процессных сценариев** на независимом
+`scripts/e2e.py` проходит **21 процессный сценарий** на независимом
 `examples/axum-service.rs`. Подписи создаёт одноразовый Ed25519 key через OpenSSL,
 проверяет библиотека Rust. Проверены:
 
@@ -73,6 +73,8 @@ graceful drain/закрытие ресурсов приложением → fini
 - External, read-only standalone directory и ManualOnly supervisor: check доступен,
   install запрещён, artifact не запрашивается.
 - Оба режима: ошибка shutdown и EOF без clean marker не разрешают switch.
+- Standalone: клиент install отключается без чтения ответа; фоновый handoff
+  доводит установку до подтверждённой готовности.
 - Ограниченный реальный tmpfs: нехватка места обнаруживается до download/shutdown.
 - Непривилегированный UID: обновляется private working copy root-owned launcher
   в каталоге без права записи; исходный launcher неизменен.
