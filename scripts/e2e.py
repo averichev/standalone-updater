@@ -57,6 +57,8 @@ def eventually(function, predicate=bool, timeout=30):
             last = function()
             if predicate(last):
                 return last
+        except urllib.error.HTTPError as error:
+            last = (error.code, error.read(1024).decode(errors="replace"))
         except (OSError, urllib.error.URLError, ValueError) as error:
             last = type(error).__name__
         time.sleep(0.05)
@@ -555,6 +557,12 @@ def run_cases(fixtures):
             print("Failure logs:", flush=True)
             for log in root.glob("*/process.log"):
                 print(log.parent.name, log.read_text(errors="replace")[-5000:], flush=True)
+                updates = log.parent / "working directory/updates"
+                status = updates / "status.json"
+                if status.exists():
+                    print("Durable status:", status.read_text(), flush=True)
+                if updates.exists():
+                    print("Staging files:", [(p.name, p.stat().st_size) for p in (updates / "staging").glob("*") if p.is_file()], flush=True)
             raise
         finally:
             source.stop()

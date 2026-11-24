@@ -195,7 +195,8 @@ pub async fn run(mut config: RuntimeConfig) -> Result<()> {
             || files::open_regular(&job.executable)
                 .and_then(|mut file| files::hash_file(&mut file))
                 .is_ok_and(|hash| hash != job.previous_sha256);
-        let _ = transition(&store, &mut status, Stage::Failed, error.to_string());
+        let message = format!("{}: {error}", status.message);
+        let _ = transition(&store, &mut status, Stage::Failed, message);
     }
     result
 }
@@ -220,7 +221,9 @@ async fn run_job(
     {
         return Err(UpdateError::Worker);
     }
+    status.message = "Worker validating executable layout".into();
     let layout = config.layout()?;
+    status.message = "Worker verifying original executable and private copy".into();
     if std::env::current_exe()? != layout.staging.path(&job.worker())?
         || files::hash_file(&mut files::open_regular(&std::env::current_exe()?)?)?
             != job.previous_sha256
@@ -228,6 +231,7 @@ async fn run_job(
     {
         return Err(UpdateError::Integrity("worker/текущий бинарник изменился"));
     }
+    status.message = "Worker verifying signature, prepared artifact and backup".into();
     let client = config.client()?;
     let metadata = client.verify_context(&job.signed.version, &job.signed.signed_metadata)?;
     files::verify_file(&layout.staging.path(&job.ready())?, &metadata)?;
@@ -236,6 +240,7 @@ async fn run_job(
         &job.acknowledged(),
         &files::process_identity(std::process::id()).ok_or(UpdateError::Worker)?,
     )?;
+    status.message = "Worker awaiting clean shutdown acknowledgement".into();
     // EOF alone is insufficient: a crash is not approval to replace the executable.
     let mut tail = Vec::new();
     tokio::time::timeout(

@@ -1,6 +1,7 @@
 use super::{files::*, worker::*, *};
 use std::{
     fs,
+    io::Write,
     os::unix::fs::{PermissionsExt, symlink},
 };
 
@@ -230,7 +231,17 @@ fn fixture(
     executable(&app, "/bin/true");
     let store = Directory::private(&root.join("state")).unwrap();
     let layout = ExecutableLayout::inspect(&app, &store.as_path().join("staging")).unwrap();
-    let candidate = fs::read("/bin/false").unwrap();
+    // Some distributions use multicall coreutils with identical file bytes.
+    // Give each fixture a distinct trailer without changing valid ELF segments.
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&app)
+        .unwrap()
+        .write_all(b"baseline-fixture-v1")
+        .unwrap();
+    let mut candidate = fs::read("/bin/true").unwrap();
+    candidate.extend_from_slice(b"candidate-fixture-v2");
+    let candidate_size = candidate.len() as u64;
     let job = PreparedJob {
         operation_id: operation_id().unwrap(),
         executable: app,
@@ -263,7 +274,7 @@ fn fixture(
         version: "0.6.0".into(),
         os: "linux".into(),
         arch: std::env::consts::ARCH.into(),
-        size_bytes: fs::metadata("/bin/false").unwrap().len(),
+        size_bytes: candidate_size,
         sha256: job.candidate_sha256.clone(),
     };
     let status = OperationStatus {
@@ -308,19 +319,27 @@ fn manual_replacement_and_corrupt_backup_are_not_overwritten() {
     let temporary = tempfile::tempdir().unwrap();
     let (store, layout, job, metadata, mut status) = fixture(temporary.path());
     let replacement = temporary.path().join("manual.part");
-    executable(&replacement, "/bin/ls");
+    executable(&replacement, "/bin/true");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&replacement)
+        .unwrap()
+        .write_all(b"manual-replacement-v3")
+        .unwrap();
+    let manual_bytes = fs::read(&replacement).unwrap();
     fs::rename(&replacement, &layout.executable).unwrap();
     assert!(matches!(
         switch_binary(&store, &mut status, &job, &layout, &metadata),
         Err(UpdateError::Stale)
     ));
     assert!(restore_binary(&layout, &job.recovery()).is_err());
-    assert_eq!(
-        fs::read(&layout.executable).unwrap(),
-        fs::read("/bin/ls").unwrap()
-    );
+    assert_eq!(fs::read(&layout.executable).unwrap(), manual_bytes);
     // Corrupt backup cannot restore even a known candidate.
-    fs::copy("/bin/false", &layout.executable).unwrap();
+    fs::copy(
+        layout.staging.path(&job.ready()).unwrap(),
+        &layout.executable,
+    )
+    .unwrap();
     fs::write(layout.staging.path(&job.backup()).unwrap(), b"corrupt").unwrap();
     assert!(restore_binary(&layout, &job.recovery()).is_err());
 }

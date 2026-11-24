@@ -406,8 +406,17 @@ impl UpdateManager {
             .take()
             .ok_or(UpdateError::Stale)?;
         if let Err(error) = self.begin_handoff(&job, &mut status).await {
+            // A worker can persist a more precise redacted failure before exiting.
+            // Do not replace that evidence with a generic handshake error.
+            if let Ok(failed) = store.status()
+                && failed.operation_id == status.operation_id
+                && failed.state == Stage::Failed
+            {
+                status = failed;
+            } else {
+                mark_failed(&mut status, &error);
+            }
             status.worker = None;
-            mark_failed(&mut status, &error);
             store.save_status(&mut status)?;
             return Err(error);
         }
