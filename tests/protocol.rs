@@ -513,3 +513,52 @@ fn descriptor_duplicates_and_noncanonical_jws_are_rejected() {
         assert!(canonical_version(bad).is_err());
     }
 }
+
+#[tokio::test]
+async fn monitor_keeps_manual_urls_transient_and_checks_in_background() {
+    let server = Server::new().await;
+    server.response(StatusCode::NO_CONTENT, "");
+    *server.state.manifest.lock().unwrap() = (StatusCode::OK, serde_json::json!({
+        "schema_version": 2, "releases": [{"version":"0.6.0", "notes":"manual hint", "artifacts":[{
+            "purpose":"executable", "target":"linux-x86_64", "download_url":format!("{}/artifact?token=transient-secret", server.base)
+        }]}]
+    }).to_string());
+    let monitor =
+        standalone_updater::UpdateMonitor::new(source(&server.base), "0.5.0", "linux-x86_64")
+            .unwrap();
+    assert_eq!(
+        monitor.status().unwrap().state,
+        standalone_updater::Stage::Idle
+    );
+    monitor.check().unwrap();
+    assert!(matches!(monitor.check(), Err(UpdateError::Busy)));
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = monitor.status().unwrap();
+            if !status.state.busy() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        status.check_outcome,
+        standalone_updater::CheckOutcome::NoUpdate
+    );
+    assert!(
+        monitor
+            .manual_release()
+            .unwrap()
+            .unwrap()
+            .download_url
+            .contains("transient-secret")
+    );
+    assert!(
+        !serde_json::to_string(&status)
+            .unwrap()
+            .contains("transient-secret")
+    );
+    assert!(!monitor.summary().unwrap().installation_supported);
+}

@@ -30,6 +30,7 @@ struct Inner {
     prepared: Mutex<Option<PreparedJob>>,
     handoff: Mutex<Option<PreparedJob>>,
     shutdown: watch::Sender<bool>,
+    manual_release: Mutex<Option<ManualRelease>>,
 }
 
 /// Cloneable update operations and durable polling snapshots. It creates no
@@ -101,6 +102,7 @@ impl UpdateManager {
             prepared: Mutex::new(None),
             handoff: Mutex::new(None),
             shutdown,
+            manual_release: Mutex::new(None),
         }));
         manager.reconcile_interrupted()?;
         Ok(manager)
@@ -144,6 +146,19 @@ impl UpdateManager {
         self.0.store.status()
     }
 
+    /// Last manifest download hint, kept only in memory. The URL may contain
+    /// credentials and must never be written to persistent status or diagnostics.
+    /// After a restart, check again to obtain a fresh hint. This does not grant
+    /// permission to install an unsigned artifact.
+    pub fn manual_release(&self) -> Result<Option<ManualRelease>> {
+        Ok(self
+            .0
+            .manual_release
+            .lock()
+            .map_err(|_| UpdateError::Worker)?
+            .clone())
+    }
+
     /// Read diagnostics suitable for a polling or SSE adapter.
     pub fn summary(&self) -> Result<UpdateSummary> {
         let status = self.status()?;
@@ -175,6 +190,11 @@ impl UpdateManager {
         if previous.state.busy() {
             return Err(UpdateError::Busy);
         }
+        *self
+            .0
+            .manual_release
+            .lock()
+            .map_err(|_| UpdateError::Worker)? = None;
         let mut status = OperationStatus {
             operation_id: Some(operation_id()?),
             state: Stage::Checking,
@@ -191,6 +211,9 @@ impl UpdateManager {
             status.last_checked = Some(now());
             match result {
                 Ok(result) => {
+                    if let Ok(mut manual) = manager.0.manual_release.lock() {
+                        *manual = result.manual.clone();
+                    }
                     status.manual_release = result.manual.map(|r| ManualReleaseInfo {
                         version: r.version,
                         notes: r.notes,
