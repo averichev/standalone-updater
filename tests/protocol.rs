@@ -562,3 +562,98 @@ async fn monitor_keeps_manual_urls_transient_and_checks_in_background() {
     );
     assert!(!monitor.summary().unwrap().installation_supported);
 }
+
+#[tokio::test]
+async fn check_cache_survives_restart_without_urls_or_installation_state() {
+    let server = Server::new().await;
+    let temporary = tempfile::tempdir().unwrap();
+    let directory = temporary.path().canonicalize().unwrap().join("checks");
+    let monitor =
+        standalone_updater::UpdateMonitor::new(source(&server.base), "0.5.0", "linux-x86_64")
+            .unwrap()
+            .with_cache(&directory)
+            .unwrap();
+    monitor.check().unwrap();
+    let checked = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = monitor.status().unwrap();
+            if !status.state.busy() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(checked.state, standalone_updater::Stage::Available);
+    let cache = directory.join("checks.json");
+    let bytes = std::fs::read(&cache).unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains(&server.base));
+    let reopened = || {
+        standalone_updater::UpdateMonitor::new(source(&server.base), "0.5.0", "linux-x86_64")
+            .unwrap()
+            .with_cache(&directory)
+    };
+    assert_eq!(
+        reopened().unwrap().status().unwrap().last_checked,
+        checked.last_checked
+    );
+    assert_eq!(
+        reopened()
+            .unwrap()
+            .status()
+            .unwrap()
+            .available
+            .unwrap()
+            .version,
+        "0.6.0"
+    );
+    assert!(reopened().unwrap().manual_release().unwrap().is_none());
+    for (version, target) in [("0.6.0", "linux-x86_64"), ("0.5.0", "darwin-x86_64")] {
+        let other = standalone_updater::UpdateMonitor::new(source(&server.base), version, target)
+            .unwrap()
+            .with_cache(&directory)
+            .unwrap();
+        assert_eq!(
+            other.status().unwrap().check_outcome,
+            standalone_updater::CheckOutcome::NotChecked
+        );
+    }
+    let mut another_product = source(&server.base);
+    another_product.product_id = "11111111-1111-4111-8111-111111111111".into();
+    assert_eq!(
+        standalone_updater::UpdateMonitor::new(another_product, "0.5.0", "linux-x86_64")
+            .unwrap()
+            .with_cache(&directory)
+            .unwrap()
+            .status()
+            .unwrap()
+            .state,
+        standalone_updater::Stage::Idle
+    );
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    value["status"]["state"] = "prepared".into();
+    std::fs::write(&cache, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(matches!(reopened(), Err(UpdateError::Document)));
+    value["status"]["state"] = "checking".into();
+    std::fs::write(&cache, serde_json::to_vec(&value).unwrap()).unwrap();
+    let interrupted = reopened().unwrap().status().unwrap();
+    assert_eq!(interrupted.state, standalone_updater::Stage::Failed);
+    assert!(!interrupted.recovery_required);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let link = directory.parent().unwrap().join("alias");
+        std::os::unix::fs::symlink(&directory, &link).unwrap();
+        assert!(
+            standalone_updater::UpdateMonitor::new(source(&server.base), "0.5.0", "linux-x86_64")
+                .unwrap()
+                .with_cache(&link)
+                .is_err()
+        );
+    }
+}

@@ -25,6 +25,7 @@ mod artifact;
 mod client;
 mod models;
 mod monitor;
+mod monitor_cache;
 pub use monitor::{CheckSummary, UpdateMonitor};
 
 #[cfg(all(feature = "linux-runtime", target_os = "linux"))]

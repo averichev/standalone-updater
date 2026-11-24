@@ -1,11 +1,13 @@
-//! In-memory check orchestration for applications without an installation runtime.
+//! Check orchestration for applications without an installation runtime.
 use crate::*;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
-/// Cloneable background checks with redacted snapshots, without filesystem access.
+/// Cloneable background checks with redacted snapshots, with an optional private redacted cache.
 pub struct UpdateMonitor {
     client: UpdateClient,
+    identity: crate::monitor_cache::Identity,
+    cache: Option<crate::monitor_cache::Cache>,
     snapshot: Arc<Mutex<(OperationStatus, Option<ManualRelease>)>>,
 }
 /// Check-only diagnostics. Installation always belongs to the caller.
@@ -22,10 +24,31 @@ pub struct CheckSummary {
 impl UpdateMonitor {
     /// Construct a check-only monitor. No network requests occur until `check`.
     pub fn new(source: UpdateSource, current_version: &str, target: &str) -> Result<Self> {
+        let product_id = source.product_id.clone();
+        let client = UpdateClient::new(source, current_version, target)?;
+        let identity = crate::monitor_cache::Identity {
+            product_id,
+            current_version: current_version.into(),
+            target: target.into(),
+            key_id: client.key_id().into(),
+        };
         Ok(Self {
-            client: UpdateClient::new(source, current_version, target)?,
+            client,
+            identity,
+            cache: None,
             snapshot: Arc::new(Mutex::new((OperationStatus::default(), None))),
         })
+    }
+    /// Retain redacted check results in a dedicated process-owned directory.
+    /// This cache is bound to product/key/version/target, contains no download
+    /// URLs and never accepts installation/recovery state. No network is used.
+    /// Existing symlinks or unsafe permissions are rejected, not repaired.
+    pub fn with_cache(mut self, directory: &std::path::Path) -> Result<Self> {
+        let cache = crate::monitor_cache::Cache::open(directory, self.identity.clone())?;
+        let status = cache.load()?;
+        *self.snapshot.lock().map_err(|_| UpdateError::Worker)? = (status, None);
+        self.cache = Some(cache);
+        Ok(self)
     }
     /// Read the latest in-memory snapshot.
     pub fn status(&self) -> Result<OperationStatus> {
@@ -77,6 +100,9 @@ impl UpdateMonitor {
             last_checked: current.0.last_checked,
             ..Default::default()
         };
+        if let Some(cache) = &self.cache {
+            cache.save(&status)?;
+        }
         *current = (status.clone(), None);
         let initial = status.clone();
         let checks = self.clone();
@@ -127,6 +153,13 @@ impl UpdateMonitor {
                     };
                     status.message = error.to_string();
                 }
+            }
+            status.updated_at = status.last_checked.unwrap_or_default();
+            if let Some(cache) = &checks.cache
+                && let Err(error) = cache.save(&status)
+            {
+                status.state = Stage::Failed;
+                status.message = error.to_string();
             }
             if let Ok(mut current) = checks.snapshot.lock() {
                 *current = (status, manual);
