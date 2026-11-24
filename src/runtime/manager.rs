@@ -123,6 +123,17 @@ impl UpdateManager {
         if !status.state.busy() || status.worker.as_ref().is_some_and(files::process_alive) {
             return Ok(());
         }
+        if status.state == Stage::Prepared
+            && self
+                .0
+                .prepared
+                .lock()
+                .map_err(|_| UpdateError::Worker)?
+                .as_ref()
+                .is_some_and(|job| Some(&job.operation_id) == status.operation_id.as_ref())
+        {
+            return Ok(());
+        }
         status.recovery_required = status.state.may_have_switched();
         if let Some(id) = status
             .operation_id
@@ -653,4 +664,53 @@ fn mark_failed(status: &mut OperationStatus, error: &UpdateError) {
         UpdateError::Unsupported(_) => CheckOutcome::Unsupported,
         _ => CheckOutcome::Unavailable,
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn polling_retains_a_prepared_job_owned_by_the_current_process() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (store, layout, job, _, mut status) = crate::runtime::tests::fixture(temporary.path());
+        let config = RuntimeConfig {
+            source: UpdateSource {
+                product_id: job.product_id.clone(),
+                manifest_url: "http://127.0.0.1:1/manifest".into(),
+                descriptor_url: "http://127.0.0.1:1/descriptor".into(),
+                public_key: PublicKey {
+                    kty: "OKP".into(),
+                    crv: "Ed25519".into(),
+                    x: "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo".into(),
+                },
+                allowed_download_origins: vec![],
+                max_artifact_bytes: 1024,
+            },
+            build: BuildInfo {
+                version: job.previous_version.clone(),
+                rust_target: job.rust_target.clone(),
+                product_id: job.product_id.clone(),
+                self_update_protocol: 1,
+                data_compatibility: job.data_compatibility.clone(),
+            },
+            mode: InstallationMode::External,
+            executable: layout.executable.clone(),
+            updates_directory: store.as_path().into(),
+            arguments: vec![],
+            working_directory: temporary.path().into(),
+            data_policy: DataPolicy::RequireExact,
+            readiness: Readiness::http("127.0.0.1:8080".parse().unwrap(), "/ready"),
+        };
+        let manager = UpdateManager::new(config, None).unwrap();
+        status.state = Stage::Prepared;
+        *manager.0.prepared.lock().unwrap() = Some(job);
+        store.save_status(&mut status).unwrap();
+        for _ in 0..3 {
+            assert_eq!(manager.status().unwrap().state, Stage::Prepared);
+        }
+        manager.0.prepared.lock().unwrap().take();
+        assert_eq!(manager.status().unwrap().state, Stage::Failed);
+        assert!(!manager.status().unwrap().recovery_required);
+    }
 }

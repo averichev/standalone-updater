@@ -218,7 +218,7 @@ fn executable_directory_must_be_writable_even_when_running_as_root() {
     );
 }
 
-fn fixture(
+pub(super) fn fixture(
     root: &std::path::Path,
 ) -> (
     Directory,
