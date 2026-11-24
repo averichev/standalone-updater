@@ -1,0 +1,56 @@
+[package]
+name = "standalone-updater"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Signed standalone updates with an optional recoverable Linux installation runtime"
+license = "MIT"
+repository = "https://github.com/averichev/standalone-updater"
+readme = "README.md"
+keywords = ["update", "standalone", "ed25519", "linux"]
+categories = ["network-programming", "os"]
+# Release gate: enable only after reintegration, license and security review.
+publish = false
+exclude = ["target/", "docs/validation/", "scripts/"]
+
+[features]
+default = []
+linux-runtime = ["dep:libc", "dep:getrandom", "tokio/process", "tokio/signal", "tokio/io-std", "tokio/sync"]
+
+[dependencies]
+base64 = "0.23.1"
+ed25519-dalek = "3"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"] }
+semver = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "time"] }
+url = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2", optional = true }
+getrandom = { version = "0.4", optional = true }
+
+[dev-dependencies]
+axum = "0.8"
+tempfile = "3"
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "sync"] }
+
+[[example]]
+name = "axum-service"
+required-features = ["linux-runtime"]
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[package.metadata.docs.rs]
+features = ["linux-runtime"]
+
+[profile.e2e]
+inherits = "dev"
+debug = 0
+strip = "debuginfo"
