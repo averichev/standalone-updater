@@ -12,16 +12,18 @@ pub struct PublicKey {
     pub x: String,
 }
 
-/// Trust anchors and independent endpoint URLs supplied by the application.
+/// Trust anchors, manifest URL and download policy supplied by the application.
 /// Debug output deliberately omits endpoint URLs.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateSource {
     /// Permanent canonical publisher UUID.
     pub product_id: String,
-    /// Independent schema-v2 manifest URL; hints only.
+    /// Schema-v2 manifest URL, including per-artifact signed metadata for automatic updates.
     pub manifest_url: String,
-    /// Complete endpoint URL. Only `{target}` substitution is supported.
+    /// Optional legacy descriptor endpoint with `{target}` substitution.
+    /// An omitted or empty value selects signed artifacts from the manifest.
+    #[serde(default)]
     pub descriptor_url: String,
     /// Pinned public key; keys returned by a server are never adopted.
     pub public_key: PublicKey,
@@ -29,6 +31,26 @@ pub struct UpdateSource {
     pub allowed_download_origins: Vec<String>,
     /// Positive local artifact size limit, at most 4 GiB.
     pub max_artifact_bytes: u64,
+}
+
+impl UpdateSource {
+    /// Configure a channel with one manifest URL and the application's pinned trust and limits.
+    pub fn from_manifest(
+        manifest_url: impl Into<String>,
+        product_id: impl Into<String>,
+        public_key: PublicKey,
+        allowed_download_origins: Vec<String>,
+        max_artifact_bytes: u64,
+    ) -> Self {
+        Self {
+            manifest_url: manifest_url.into(),
+            descriptor_url: String::new(),
+            product_id: product_id.into(),
+            public_key,
+            allowed_download_origins,
+            max_artifact_bytes,
+        }
+    }
 }
 
 /// Untrusted protocol v1 descriptor. Never persist its potentially signed URL.
@@ -101,7 +123,7 @@ pub struct CheckResult {
     pub manual: Option<ManualRelease>,
     /// Untrusted notes for the signed candidate, bounded to 4000 characters.
     pub notes: String,
-    /// The optional manifest could not be read or parsed.
+    /// The supplementary manifest could not be read in legacy descriptor mode.
     pub manifest_unavailable: bool,
 }
 

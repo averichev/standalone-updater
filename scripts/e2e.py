@@ -144,7 +144,10 @@ class Source:
                         self.document(document)
                 elif path == "/manifest":
                     document = source.documents[source.variant]
-                    self.document(dict(schema_version=2, releases=[dict(version=document["version"], notes="Disposable signed release", artifacts=[dict(purpose="executable", target=source.target, download_url=document["url"])])]))
+                    artifact = dict(purpose="executable", target=source.target,
+                                    download_url=document["url"], signed_metadata=document["signed_metadata"])
+                    release = dict(version=document["version"], notes="Disposable signed release", artifacts=[artifact])
+                    self.document(dict(schema_version=2, releases=[release]))
                 elif path == "/artifact/" + source.variant:
                     source.downloads += 1
                     binary = source.fixtures / source.variant
@@ -182,7 +185,7 @@ class Source:
 
 
 class App:
-    def __init__(self, root, fixtures, source, mode="supervisor", readonly=False, unprivileged=False, initial="old", manual_only=False):
+    def __init__(self, root, fixtures, source, mode="supervisor", readonly=False, unprivileged=False, initial="old", manual_only=False, legacy_descriptor=False):
         self.root = root
         self.root.mkdir(mode=0o700)
         self.work = root / "working directory"
@@ -198,7 +201,12 @@ class App:
         self.port = unused_port()
         self.base = f"http://127.0.0.1:{self.port}"
         self.mode = mode
-        self.settings = dict(source=dict(product_id=PRODUCT, manifest_url=source.base + "/manifest", descriptor_url=source.base + "/descriptor/{target}", public_key=source.public_key, allowed_download_origins=[source.base], max_artifact_bytes=128 * 1024 * 1024), mode=mode, updates_directory=str(self.updates), data_file=str(self.data), address=f"127.0.0.1:{self.port}", health_timeout_ms=3000)
+        update_source = dict(product_id=PRODUCT, manifest_url=source.base + "/manifest",
+                             public_key=source.public_key, allowed_download_origins=[source.base],
+                             max_artifact_bytes=128 * 1024 * 1024)
+        if legacy_descriptor:
+            update_source["descriptor_url"] = source.base + "/descriptor/{target}"
+        self.settings = dict(source=update_source, mode=mode, updates_directory=str(self.updates), data_file=str(self.data), address=f"127.0.0.1:{self.port}", health_timeout_ms=3000)
         self.settings["manual_data_policy"] = manual_only
         self.config.write_text(json.dumps(self.settings))
         self.config.chmod(0o600)
@@ -337,7 +345,7 @@ def run_cases(fixtures):
 
         try:
             source.select()
-            instance = app("standalone")
+            instance = app("standalone", legacy_descriptor=True)
             try:
                 operation = instance.prepare()
                 source.stop()

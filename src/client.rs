@@ -18,6 +18,7 @@ pub struct UpdateClient {
     source: UpdateSource,
     current: Version,
     target: String,
+    descriptor_endpoint: Option<Url>,
     metadata_client: Client,
     download_client: Client,
     key: VerifyingKey,
@@ -174,17 +175,20 @@ impl UpdateClient {
             ));
         }
         parse_url(&source.manifest_url)?;
-        let endpoint = parse_url(&source.descriptor_url.replace("{target}", target))?;
-        if endpoint.query().is_some()
-            || source
-                .descriptor_url
-                .replace("{target}", target)
-                .contains(['{', '}'])
-        {
-            return Err(UpdateError::Unsupported(
-                "update endpoint должен быть задан явно без query",
-            ));
-        }
+        let descriptor_endpoint = if source.descriptor_url.is_empty() {
+            None
+        } else {
+            let expanded = source.descriptor_url.replace("{target}", target);
+            let mut url = parse_url(&expanded)?;
+            if url.query().is_some() || expanded.contains(['{', '}']) {
+                return Err(UpdateError::Unsupported(
+                    "update endpoint должен быть задан явно без query",
+                ));
+            }
+            url.query_pairs_mut()
+                .append_pair("current_version", current_version);
+            Some(url)
+        };
         for origin in &source.allowed_download_origins {
             let url = parse_url(origin)?;
             if url.origin().ascii_serialization() != *origin {
@@ -207,6 +211,7 @@ impl UpdateClient {
         Ok(Self {
             current: canonical_version(current_version)?,
             target: target.into(),
+            descriptor_endpoint,
             metadata_client: client(None, Duration::from_secs(20))?,
             download_client: client(
                 Some(source.allowed_download_origins.clone()),
@@ -306,13 +311,10 @@ impl UpdateClient {
         Ok(metadata)
     }
 
-    async fn descriptor(&self) -> Result<Option<VerifiedUpdate>> {
-        let mut url = parse_url(&self.source.descriptor_url.replace("{target}", &self.target))?;
-        url.query_pairs_mut()
-            .append_pair("current_version", &self.current.to_string());
+    async fn descriptor(&self, url: &Url) -> Result<Option<VerifiedUpdate>> {
         let response = self
             .metadata_client
-            .get(url)
+            .get(url.clone())
             .header("Accept", "application/json")
             .header("Cache-Control", "no-cache")
             .send()
@@ -342,6 +344,7 @@ impl UpdateClient {
             .metadata_client
             .get(&self.source.manifest_url)
             .header("Accept", "application/json")
+            .header("Cache-Control", "no-cache")
             .send()
             .await
             .map_err(|_| UpdateError::Unavailable)?;
@@ -357,32 +360,27 @@ impl UpdateClient {
         Ok(manifest)
     }
 
-    /// Check descriptor and manifest. Manifest failures cannot authorize installation.
+    /// Check one manifest, or use the configured legacy descriptor as the signed source.
     pub async fn check(&self) -> Result<CheckResult> {
-        let (signed, manifest) = tokio::join!(self.descriptor(), self.manifest());
-        let update = signed?;
+        let (update, manifest) = if let Some(url) = &self.descriptor_endpoint {
+            let (update, manifest) = tokio::join!(self.descriptor(url), self.manifest());
+            (update?, manifest.ok())
+        } else {
+            let manifest = self.manifest().await?;
+            let update = manifest
+                .latest_signed(&self.target, &self.current)
+                .map(|descriptor| self.verify(descriptor))
+                .transpose()?;
+            (update, Some(manifest))
+        };
         let mut result = CheckResult {
             update,
             manual: None,
             notes: String::new(),
-            manifest_unavailable: manifest.is_err(),
+            manifest_unavailable: manifest.is_none(),
         };
-        if let Ok(manifest) = manifest {
-            let mut releases = manifest.releases;
-            if let Some(release) = manifest
-                .latest_by_type
-                .get("executable")
-                .and_then(|targets| targets.get(&self.target))
-            {
-                releases.push(release.clone());
-            }
-            for release in releases {
-                let Ok(version) = canonical_version(&release.version) else {
-                    continue;
-                };
-                if !version.pre.is_empty() || !version.cmp_precedence(&self.current).is_gt() {
-                    continue;
-                }
+        if let Some(manifest) = manifest {
+            for (version, release) in manifest.newer_releases(&self.target, &self.current) {
                 if result
                     .update
                     .as_ref()
@@ -395,13 +393,12 @@ impl UpdateClient {
                 }) {
                     continue;
                 }
-                if let Some(artifact) = release.artifacts.iter().find(|a| {
-                    a.target == self.target
-                        && a.purpose == "executable"
-                        && self.artifact_url(&a.download_url).is_ok()
-                }) {
+                if let Some(artifact) = release
+                    .executables(&self.target)
+                    .find(|a| self.artifact_url(&a.download_url).is_ok())
+                {
                     result.manual = Some(ManualRelease {
-                        version: release.version,
+                        version: release.version.clone(),
                         notes: release.notes.chars().take(4_000).collect(),
                         download_url: artifact.download_url.clone(),
                     });
@@ -499,7 +496,7 @@ struct Manifest {
     #[serde(default)]
     latest_by_type: BTreeMap<String, BTreeMap<String, ManifestRelease>>,
 }
-#[derive(Clone, Deserialize)]
+#[derive(Deserialize)]
 struct ManifestRelease {
     version: String,
     #[serde(default)]
@@ -507,9 +504,57 @@ struct ManifestRelease {
     #[serde(default)]
     artifacts: Vec<ManifestArtifact>,
 }
-#[derive(Clone, Deserialize)]
+#[derive(Deserialize)]
 struct ManifestArtifact {
     target: String,
     purpose: String,
     download_url: String,
+    signed_metadata: Option<String>,
+}
+
+impl ManifestRelease {
+    fn executables<'a>(&'a self, target: &'a str) -> impl Iterator<Item = &'a ManifestArtifact> {
+        self.artifacts
+            .iter()
+            .filter(move |artifact| artifact.purpose == "executable" && artifact.target == target)
+    }
+}
+
+impl Manifest {
+    fn newer_releases<'a>(
+        &'a self,
+        target: &str,
+        current: &'a Version,
+    ) -> impl Iterator<Item = (Version, &'a ManifestRelease)> {
+        let latest = self
+            .latest_by_type
+            .get("executable")
+            .and_then(|targets| targets.get(target));
+        self.releases
+            .iter()
+            .chain(latest)
+            .filter_map(move |release| {
+                let version = canonical_version(&release.version).ok()?;
+                (version.pre.is_empty() && version.cmp_precedence(current).is_gt())
+                    .then_some((version, release))
+            })
+    }
+
+    fn latest_signed(&self, target: &str, current: &Version) -> Option<Descriptor> {
+        let (version, url, signature) = self
+            .newer_releases(target, current)
+            .filter_map(|(version, release)| {
+                let (url, signature) = release.executables(target).find_map(|artifact| {
+                    let signature = artifact.signed_metadata.as_ref()?;
+                    Some((&artifact.download_url, signature))
+                })?;
+                Some((version, url, signature))
+            })
+            .max_by(|(left, ..), (right, ..)| left.cmp_precedence(right))?;
+        Some(Descriptor {
+            version: version.to_string(),
+            url: url.clone(),
+            signed_metadata: signature.clone(),
+        })
+    }
 }

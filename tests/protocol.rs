@@ -79,10 +79,24 @@ fn descriptor(base: &str, payload: Value) -> Descriptor {
     }
 }
 
+fn manifest_release(base: &str, version: &str) -> Value {
+    let mut metadata = payload(&elf());
+    metadata["version"] = json!(version);
+    let signed = descriptor(base, metadata);
+    json!({
+        "version": version, "notes": format!("Notes for {version}"),
+        "artifacts": [{
+            "target": "linux-x86_64", "purpose": "executable",
+            "download_url": signed.url, "signed_metadata": signed.signed_metadata
+        }]
+    })
+}
+
 #[derive(Clone)]
 struct ServerState {
     descriptor: Arc<Mutex<(StatusCode, String)>>,
     manifest: Arc<Mutex<(StatusCode, String)>>,
+    manifest_requests: Arc<Mutex<Vec<String>>>,
     artifact: Arc<Mutex<Vec<u8>>>,
     broken: Arc<Mutex<bool>>,
     query: Arc<Mutex<String>>,
@@ -111,6 +125,7 @@ impl Server {
                 StatusCode::OK,
                 json!({"schema_version":2,"releases":[]}).to_string(),
             ))),
+            manifest_requests: Arc::default(),
             artifact: Arc::new(Mutex::new(elf())),
             broken: Arc::new(Mutex::new(false)),
             query: Arc::new(Mutex::new(String::new())),
@@ -129,6 +144,19 @@ impl Server {
     fn client(&self) -> UpdateClient {
         UpdateClient::new(source(&self.base), "0.5.0", "linux-x86_64").unwrap()
     }
+    fn manifest_client(&self) -> UpdateClient {
+        let source = UpdateSource::from_manifest(
+            format!("{}/manifest", self.base),
+            PRODUCT,
+            public_key(),
+            vec![self.base.clone()],
+            1024 * 1024,
+        );
+        UpdateClient::new(source, "0.5.0", "linux-x86_64").unwrap()
+    }
+    fn set_manifest(&self, document: Value) {
+        *self.state.manifest.lock().unwrap() = (StatusCode::OK, document.to_string());
+    }
     fn response(&self, code: StatusCode, body: impl Into<String>) {
         *self.state.descriptor.lock().unwrap() = (code, body.into());
     }
@@ -146,7 +174,12 @@ async fn serve_descriptor(State(state): State<ServerState>, request: Request) ->
     let (status, body) = state.descriptor.lock().unwrap().clone();
     (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
-async fn serve_manifest(State(state): State<ServerState>) -> Response {
+async fn serve_manifest(State(state): State<ServerState>, request: Request) -> Response {
+    state
+        .manifest_requests
+        .lock()
+        .unwrap()
+        .push(request.uri().to_string());
     state.manifest.lock().unwrap().clone().into_response()
 }
 async fn serve_artifact(State(state): State<ServerState>) -> Response {
@@ -170,6 +203,113 @@ async fn serve_artifact(State(state): State<ServerState>) -> Response {
             .into_response();
     }
     bytes.into_response()
+}
+
+#[tokio::test]
+async fn one_manifest_selects_the_newest_signed_executable_and_downloads_it() {
+    let server = Server::new().await;
+    let release = |v| manifest_release(&server.base, v);
+    let mut manual = release("0.11.0");
+    manual["artifacts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("signed_metadata");
+    let mut foreign = release("2.0.0");
+    foreign["artifacts"][0]["target"] = json!("linux-aarch64");
+    let mut installer = release("3.0.0");
+    installer["artifacts"][0]["purpose"] = json!("installer");
+    server.set_manifest(json!({
+        "schema_version": 2,
+        "releases": [manual, foreign, release("1.0.0-rc.1"), installer, release("0.9.0")],
+        "latest_by_type": {"executable": {"linux-x86_64": release("0.10.0")}}
+    }));
+    let config: UpdateSource = serde_json::from_value(json!({
+        "product_id": PRODUCT, "public_key": public_key(),
+        "manifest_url": format!("{}/manifest", server.base),
+        "allowed_download_origins": [server.base], "max_artifact_bytes": 1024
+    }))
+    .unwrap();
+    let client = UpdateClient::new(config, "0.5.0", "linux-x86_64").unwrap();
+    let result = client.check().await.unwrap();
+    assert_eq!(
+        *server.state.manifest_requests.lock().unwrap(),
+        ["/manifest"]
+    );
+    assert!(server.state.query.lock().unwrap().is_empty());
+    assert!(!result.manifest_unavailable);
+    assert_eq!(result.manual.unwrap().version, "0.11.0");
+    assert_eq!(result.notes, "Notes for 0.10.0");
+    let update = result.update.unwrap();
+    assert_eq!(update.metadata().version, "0.10.0");
+    client
+        .download(&update, tempfile::tempfile().unwrap(), |_| Ok(()))
+        .await
+        .unwrap();
+    server.state.artifact.lock().unwrap()[100] ^= 1;
+    assert!(matches!(
+        client
+            .download(&update, tempfile::tempfile().unwrap(), |_| Ok(()))
+            .await,
+        Err(UpdateError::Integrity(_))
+    ));
+}
+
+#[tokio::test]
+async fn manifest_rejects_invalid_signed_candidates_without_falling_back() {
+    let server = Server::new().await;
+    let client = server.manifest_client();
+    let older = manifest_release(&server.base, "0.6.0");
+    let good = manifest_release(&server.base, "0.7.0");
+    let mut bad_signature = good.clone();
+    bad_signature["artifacts"][0]["signed_metadata"] = json!("invalid");
+    let mut wrong_version = good.clone();
+    wrong_version["version"] = json!("0.8.0");
+    let mut wrong_origin = good;
+    wrong_origin["artifacts"][0]["download_url"] = json!("https://foreign.test/file");
+    for invalid in [bad_signature, wrong_version, wrong_origin] {
+        server.set_manifest(json!({"schema_version": 2, "releases": [invalid, older]}));
+        assert!(matches!(client.check().await, Err(UpdateError::Trust(_))));
+    }
+}
+
+#[tokio::test]
+async fn unsigned_manifest_offers_only_manual_download_and_requires_a_readable_manifest() {
+    let server = Server::new().await;
+    let client = server.manifest_client();
+    let mut manual = manifest_release(&server.base, "0.6.0");
+    manual["artifacts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("signed_metadata");
+    server.set_manifest(json!({"schema_version": 2, "releases": [
+        manual, manifest_release(&server.base, "0.5.0+other"), manifest_release(&server.base, "0.4.0")
+    ]}));
+    let result = client.check().await.unwrap();
+    assert!(result.update.is_none());
+    assert_eq!(result.manual.unwrap().version, "0.6.0");
+    server.set_manifest(json!({"schema_version": 99}));
+    assert!(matches!(client.check().await, Err(UpdateError::Document)));
+    *server.state.manifest.lock().unwrap() = (StatusCode::SERVICE_UNAVAILABLE, String::new());
+    assert!(matches!(client.check().await, Err(UpdateError::Http(503))));
+    let legacy = server.client().check().await.unwrap();
+    assert!(legacy.manifest_unavailable);
+    assert_eq!(legacy.update.unwrap().metadata().version, "0.6.0");
+}
+
+#[tokio::test]
+async fn explicit_descriptor_remains_authoritative_with_inline_signatures() {
+    let server = Server::new().await;
+    let client = server.client();
+    server.set_manifest(
+        json!({"schema_version": 2, "releases": [manifest_release(&server.base, "0.8.0")]}),
+    );
+    let result = client.check().await.unwrap();
+    assert_eq!(result.update.unwrap().metadata().version, "0.6.0");
+    assert_eq!(result.manual.unwrap().version, "0.8.0");
+    server.response(StatusCode::NO_CONTENT, "");
+    assert!(client.check().await.unwrap().update.is_none());
+    server.response(StatusCode::OK, r#"{"version":"0.8.0"}"#);
+    assert!(matches!(client.check().await, Err(UpdateError::Trust(_))));
 }
 
 #[tokio::test]

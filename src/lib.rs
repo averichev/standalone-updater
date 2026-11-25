@@ -1,8 +1,9 @@
 //! Signed standalone update protocol v1 and an opt-in Linux installation runtime.
 //!
 //! [`UpdateClient`] checks a pinned Ed25519 key and the full signed release context.
-//! [`VerifiedUpdate`] can only be created by successful verification. Manifest
-//! entries are untrusted hints, never installation candidates.
+//! [`VerifiedUpdate`] can only be created by successful verification of signed
+//! metadata from a manifest artifact or a legacy descriptor endpoint. Unsigned
+//! manifest entries can supply manual download hints.
 //!
 //! Enable `linux-runtime` for the `runtime` module on Linux. See the repository's
 //! `examples/axum-service.rs` for graceful shutdown, readiness and process dispatch.
