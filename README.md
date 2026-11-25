@@ -37,8 +37,7 @@ standalone-updater = { path = "../standalone-updater" }
 use standalone_updater::{UpdateClient, UpdateSource};
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-// Конфигурация принадлежит приложению: UUID, закреплённый публичный JWK,
-// независимые URL и точный allowlist origin. Приватный ключ не нужен.
+// Издатель поставляет доверенную конфигурацию вместе с приложением.
 let source: UpdateSource = serde_json::from_slice(&std::fs::read("source.json")?)?;
 let client = UpdateClient::new(source, "0.5.0", "linux-x86_64")?;
 let result = client.check().await?;
@@ -71,8 +70,10 @@ product_id, версии, target, размера и SHA-256. Протокол н
 }
 ```
 
-UUID и ключ здесь — публичные тестовые значения. Для продукта нужен собственный
-неизменный UUID и собственный закреплённый публичный ключ.
+UUID и ключ в примере — тестовые. В рабочей сборке издатель закрепляет UUID продукта и
+свой публичный ключ. URL канала (`descriptor_url`) ведёт на проверку подписанного выпуска.
+В 0.1.0 конфигурация также требует `manifest_url` для описаний и ручных ссылок.
+Локальные тесты используют собственный источник. [Контракт источника](docs/integration.md#источник-и-identity)
 
 ## Linux runtime
 
