@@ -15,7 +15,8 @@
 MSRV: **Rust 1.91**, edition 2024. `Cargo.lock` включён для разработки и испытаний.
 Основные зависимости: reqwest 0.13, ed25519-dalek 3, sha2 0.11, base64 0.23,
 serde, semver, Tokio. Версии зафиксированы lock-файлом; разрешение зависимостей
-учитывает MSRV. Linux runtime дополнительно включает libc, getrandom и процессные
+учитывает MSRV. На Unix libc используется для работы с приватными файлами.
+Linux runtime дополнительно включает getrandom и процессные
 возможности Tokio. Клиент не зависит от Axum, SQLx, MockPort или frontend.
 
 ## Подключение до публикации
@@ -75,6 +76,25 @@ if let Some(update) = result.update {
 Существующие конфигурации с отдельным `descriptor_url` продолжают получать подпись по
 этому адресу. Для перехода сначала опубликуйте подписи в манифесте, затем уберите
 `descriptor_url` из конфигурации приложения. [Формат манифеста и выбор выпуска](docs/integration.md#источник-и-identity)
+
+## Пользовательские каналы
+
+Приложение поставляет встроенный канал `default`. Через `ChannelStore` пользователь
+может сохранить несколько именованных ссылок на манифесты и выбрать одну, даже когда
+встроенный сервер недоступен. Выбор сохраняется после перезапуска. Каждая ветка ведёт
+свой список выпусков. Все выпуски проверяются ключом издателя приложения.
+
+В этом примере пользователь добавляет ветку `1.x`, проверяет её и возвращается на встроенный канал.
+
+```sh
+cargo run --example channels -- source.json ./update-settings add 1.x https://updates.example.test/1.x.json
+cargo run --example channels -- source.json ./update-settings select 1.x
+cargo run --example check -- source.json 1.4.0 linux-x86_64 ./update-settings
+cargo run --example channels -- source.json ./update-settings select default
+```
+
+В Linux-сервисе тот же список доступен через `manager.channels()`. Следующая проверка
+использует выбранный канал без перезапуска сервиса. [Подключение каналов в Rust](docs/integration.md#пользовательские-каналы)
 
 ## Linux runtime
 

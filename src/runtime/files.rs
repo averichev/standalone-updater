@@ -162,10 +162,17 @@ impl Directory {
         sync_directory(&self.path)
     }
     pub fn status(&self) -> Result<OperationStatus> {
+        Ok(self.stored_check()?.status)
+    }
+    pub fn stored_check(&self) -> Result<StoredCheck> {
         match self.read("status.json") {
-            Err(UpdateError::Io(std::io::ErrorKind::NotFound)) => Ok(OperationStatus::default()),
+            Err(UpdateError::Io(std::io::ErrorKind::NotFound)) => Ok(StoredCheck::default()),
             result => result,
         }
+    }
+    pub fn save_check(&self, status: &mut OperationStatus, source_id: &str) -> Result<()> {
+        status.updated_at = now();
+        self.write("status.json", &StoredCheck::new(status, source_id))
     }
     pub fn save_status(&self, status: &mut OperationStatus) -> Result<()> {
         status.updated_at = now();

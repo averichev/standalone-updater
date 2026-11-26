@@ -62,10 +62,13 @@ fn payload(bytes: &[u8]) -> Value {
     json!({"schema_version":1,"application_id":PRODUCT,"version":"0.6.0","os":"linux","arch":"x86_64","size_bytes":bytes.len(),"sha256":Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect::<String>()})
 }
 fn sign_raw(header: &str, payload: &str) -> String {
+    sign_with(&key(), header, payload)
+}
+fn sign_with(signer: &SigningKey, header: &str, payload: &str) -> String {
     let input = format!("{}.{}", B64.encode(header), B64.encode(payload));
     format!(
         "{input}.{}",
-        B64.encode(key().sign(input.as_bytes()).to_bytes())
+        B64.encode(signer.sign(input.as_bytes()).to_bytes())
     )
 }
 fn descriptor(base: &str, payload: Value) -> Descriptor {
@@ -203,6 +206,196 @@ async fn serve_artifact(State(state): State<ServerState>) -> Response {
             .into_response();
     }
     bytes.into_response()
+}
+
+#[test]
+fn channel_settings_persist_only_manifest_overrides_and_the_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().canonicalize().unwrap().join("settings");
+    let default = source("https://publisher.example.test");
+    let channels = ChannelStore::open(&dir, default.clone()).unwrap();
+    let entries = channels.list().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, DEFAULT_CHANNEL);
+    assert!(entries[0].selected);
+    assert_eq!(entries[0].manifest_url, default.manifest_url);
+    let url = "https://archive.example.test/releases/1.x.json";
+    channels.add("1.x", url).unwrap();
+    assert_eq!(
+        channels.active_source().unwrap().descriptor_url,
+        default.descriptor_url
+    );
+    channels.select("1.x").unwrap();
+    assert!(channels.add("1.x", "https://example.test/other").is_err());
+    assert!(channels.add(DEFAULT_CHANNEL, url).is_err());
+    assert!(channels.remove(DEFAULT_CHANNEL).is_err());
+    assert!(channels.remove("1.x").is_err());
+    assert!(channels.select("unknown").is_err());
+    for invalid in [
+        "file:///tmp/releases",
+        "http://example.test/list",
+        "https://u:p@example.test/",
+    ] {
+        assert!(channels.add("invalid", invalid).is_err());
+    }
+    let path = dir.join("channels.json");
+    let settings: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        settings,
+        json!({"schema_version": 1, "product_id": PRODUCT,
+        "selected": "1.x", "channels": {"1.x": url}})
+    );
+
+    // The next build may change the embedded source or trust policy.
+    let mut next = source("https://new.example.test");
+    next.max_artifact_bytes = 128;
+    next.public_key.x = B64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes());
+    let reopened = ChannelStore::open(&dir, next.clone()).unwrap();
+    let active = reopened.active_source().unwrap();
+    assert_eq!(active.manifest_url, url);
+    assert!(active.descriptor_url.is_empty());
+    assert_eq!(active.product_id, next.product_id);
+    assert_eq!(active.public_key.x, next.public_key.x);
+    assert_eq!(
+        active.allowed_download_origins,
+        next.allowed_download_origins
+    );
+    assert_eq!(active.max_artifact_bytes, 128);
+    let entries = reopened.list().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries.iter().find(|e| e.selected).unwrap().name, "1.x");
+    reopened.select(DEFAULT_CHANNEL).unwrap();
+    reopened.remove("1.x").unwrap();
+    assert_eq!(
+        reopened.active_source().unwrap().manifest_url,
+        next.manifest_url
+    );
+    assert_eq!(
+        reopened.active_source().unwrap().descriptor_url,
+        next.descriptor_url
+    );
+    let mut other = next;
+    other.product_id = "11111111-1111-4111-8111-111111111111".into();
+    assert!(matches!(
+        ChannelStore::open(&dir, other).unwrap().active_source(),
+        Err(UpdateError::Trust(_))
+    ));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
+fn channel_edits_merge_concurrent_writers_and_preserve_invalid_settings() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().canonicalize().unwrap().join("settings");
+    let channels = ChannelStore::open(&dir, source("https://example.test")).unwrap();
+    std::thread::scope(|scope| {
+        for name in ["one", "two", "three", "four"] {
+            let channels = channels.clone();
+            scope.spawn(move || {
+                channels
+                    .add(name, &format!("https://example.test/{name}"))
+                    .unwrap()
+            });
+        }
+    });
+    assert_eq!(channels.list().unwrap().len(), 5);
+    let path = dir.join("channels.json");
+    let settings: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for (field, value) in [
+        ("selected", json!("missing")),
+        ("public_key", json!({})),
+        (
+            "channels",
+            json!({"default": "https://elsewhere.example.test"}),
+        ),
+    ] {
+        let mut edited = settings.clone();
+        edited[field] = value;
+        let bytes = serde_json::to_vec(&edited).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            channels.active_source(),
+            Err(UpdateError::Document)
+        ));
+        assert!(channels.select(DEFAULT_CHANNEL).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+}
+
+#[tokio::test]
+async fn selected_branch_works_offline_from_the_default_and_keeps_publisher_trust() {
+    let official = Server::new().await;
+    let branch = Server::new().await;
+    official.response(StatusCode::SERVICE_UNAVAILABLE, "");
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().canonicalize().unwrap().join("settings");
+    let channels = ChannelStore::open(&dir, source(&official.base)).unwrap();
+    let client =
+        || UpdateClient::new(channels.active_source().unwrap(), "0.5.0", "linux-x86_64").unwrap();
+    assert!(matches!(
+        client().check().await,
+        Err(UpdateError::Http(503))
+    ));
+    channels
+        .add("maintenance", &format!("{}/manifest", branch.base))
+        .unwrap();
+    channels.select("maintenance").unwrap();
+    official.set_manifest(
+        json!({"schema_version": 2, "releases": [manifest_release(&official.base, "9.0.0")]}),
+    );
+    official.state.manifest_requests.lock().unwrap().clear();
+    official.state.query.lock().unwrap().clear();
+    let release = manifest_release(&official.base, "0.5.2");
+    let publish =
+        |release: Value| branch.set_manifest(json!({"schema_version": 2, "releases": [release]}));
+    publish(release.clone());
+    let client = client();
+    let update = client.check().await.unwrap().update.unwrap();
+    assert_eq!(update.metadata().version, "0.5.2");
+    client
+        .download(&update, tempfile::tempfile().unwrap(), |_| Ok(()))
+        .await
+        .unwrap();
+    let mut metadata = payload(&elf());
+    metadata["version"] = json!("0.5.2");
+    let mut forged = release;
+    forged["artifacts"][0]["signed_metadata"] = json!(sign_with(
+        &SigningKey::from_bytes(&[7; 32]),
+        r#"{"alg":"EdDSA","typ":"releases-standalone+jws"}"#,
+        &metadata.to_string(),
+    ));
+    publish(forged);
+    assert!(matches!(client.check().await, Err(UpdateError::Trust(_))));
+    publish(manifest_release(&branch.base, "0.5.2"));
+    assert!(matches!(client.check().await, Err(UpdateError::Trust(_))));
+    publish(manifest_release(&official.base, "0.4.9"));
+    assert!(client.check().await.unwrap().update.is_none());
+    *branch.state.manifest.lock().unwrap() = (StatusCode::NOT_FOUND, String::new());
+    assert!(matches!(client.check().await, Err(UpdateError::Http(404))));
+    assert!(official.state.manifest_requests.lock().unwrap().is_empty());
+    assert!(official.state.query.lock().unwrap().is_empty());
+    assert!(branch.state.query.lock().unwrap().is_empty());
+
+    let mut embedded = source(&official.base);
+    embedded.allowed_download_origins.push(branch.base.clone());
+    drop(official);
+    publish(manifest_release(&branch.base, "0.5.3"));
+    let channels = ChannelStore::open(&dir, embedded).unwrap();
+    let client =
+        UpdateClient::new(channels.active_source().unwrap(), "0.5.0", "linux-x86_64").unwrap();
+    let update = client.check().await.unwrap().update.unwrap();
+    assert_eq!(update.metadata().version, "0.5.3");
+    client
+        .download(&update, tempfile::tempfile().unwrap(), |_| Ok(()))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -759,6 +952,16 @@ async fn check_cache_survives_restart_without_urls_or_installation_state() {
             standalone_updater::CheckOutcome::NotChecked
         );
     }
+    let mut other_branch = source(&server.base);
+    other_branch.manifest_url.push_str("?branch=maintenance");
+    let monitor = UpdateMonitor::new(other_branch, "0.5.0", "linux-x86_64")
+        .unwrap()
+        .with_cache(&directory)
+        .unwrap();
+    assert_eq!(
+        monitor.status().unwrap().check_outcome,
+        CheckOutcome::NotChecked
+    );
     let mut another_product = source(&server.base);
     another_product.product_id = "11111111-1111-4111-8111-111111111111".into();
     assert_eq!(
@@ -772,6 +975,17 @@ async fn check_cache_survives_restart_without_urls_or_installation_state() {
         standalone_updater::Stage::Idle
     );
     let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let mut legacy = value.clone();
+    legacy["schema_version"] = json!(1);
+    legacy["status"]
+        .as_object_mut()
+        .unwrap()
+        .remove("check_source_id");
+    std::fs::write(&cache, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    assert_eq!(
+        reopened().unwrap().status().unwrap().check_outcome,
+        CheckOutcome::NotChecked
+    );
     value["status"]["state"] = "prepared".into();
     std::fs::write(&cache, serde_json::to_vec(&value).unwrap()).unwrap();
     assert!(matches!(reopened(), Err(UpdateError::Document)));

@@ -75,6 +75,8 @@ def build(fixtures):
     fixtures.mkdir(parents=True, exist_ok=True)
     metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version=1"], cwd=ROOT))
     target = Path(metadata["target_directory"])
+    subprocess.run(["cargo", "build", "--locked", "--profile", "e2e", "--example", "channels"], cwd=ROOT, check=True)
+    shutil.copy2(target / "e2e/examples/channels", fixtures / "channels")
     for name, version, behavior, compatibility in VARIANTS:
         env = dict(os.environ, UPDATER_EXAMPLE_VERSION=version, UPDATER_EXAMPLE_BEHAVIOR=behavior, UPDATER_EXAMPLE_DATA=compatibility)
         print(f"Building independent consumer: {name} {version}", flush=True)
@@ -185,7 +187,7 @@ class Source:
 
 
 class App:
-    def __init__(self, root, fixtures, source, mode="supervisor", readonly=False, unprivileged=False, initial="old", manual_only=False, legacy_descriptor=False):
+    def __init__(self, root, fixtures, source, mode="supervisor", readonly=False, unprivileged=False, initial="old", manual_only=False, legacy_descriptor=False, manifest_path="/manifest"):
         self.root = root
         self.root.mkdir(mode=0o700)
         self.work = root / "working directory"
@@ -201,7 +203,7 @@ class App:
         self.port = unused_port()
         self.base = f"http://127.0.0.1:{self.port}"
         self.mode = mode
-        update_source = dict(product_id=PRODUCT, manifest_url=source.base + "/manifest",
+        update_source = dict(product_id=PRODUCT, manifest_url=source.base + manifest_path,
                              public_key=source.public_key, allowed_download_origins=[source.base],
                              max_artifact_bytes=128 * 1024 * 1024)
         if legacy_descriptor:
@@ -344,6 +346,37 @@ def run_cases(fixtures):
             report.append(name)
 
         try:
+            source.select()
+            instance = app("supervisor", manifest_path="/unavailable")
+            try:
+                source_file = instance.work / "source.json"
+                source_file.write_text(json.dumps(instance.settings["source"]))
+                channels = [fixtures / "channels", source_file, instance.updates]
+                instance.call("/update/check", {}, "POST")
+                assert instance.wait_stage("failed")["status"]["check_outcome"] == "unavailable"
+                subprocess.run([*channels, "add", "maintenance", source.base + "/manifest"], check=True)
+                subprocess.run([*channels, "select", "maintenance"], check=True)
+                checked = instance.call("/update/check", {}, "POST")
+                available = instance.wait_stage("available")["status"]["available"]
+                subprocess.run([*channels, "select", "default"], check=True)
+                assert instance.status()["status"]["check_outcome"] == "not_checked"
+                request = dict(check_id=checked["operation_id"], version=available["version"])
+                expect_http(409, lambda: instance.call("/update/prepare", request, "POST"))
+                subprocess.run([*channels, "select", "maintenance"], check=True)
+                operation = instance.prepare()
+                source.stop()
+                instance.install(operation)
+                assert instance.wait_stage("completed")["current_version"] == "0.6.0"
+                instance.stop()
+                instance.start()
+                source.start()
+                instance.call("/update/check", {}, "POST")
+                assert instance.wait_stage("idle")["status"]["check_outcome"] == "no_update"
+                instance.preserved()
+                passed("custom manifest: live selection, stale check rejected, offline install and restart")
+            finally:
+                instance.close()
+
             source.select()
             instance = app("standalone", legacy_descriptor=True)
             try:

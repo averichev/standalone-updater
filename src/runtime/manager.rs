@@ -22,6 +22,7 @@ struct WorkerChannel {
 struct Inner {
     config: RuntimeConfig,
     client: UpdateClient,
+    channels: ChannelStore,
     store: Directory,
     layout: std::result::Result<ExecutableLayout, String>,
     supervisor: Option<ProcessIdentity>,
@@ -30,7 +31,7 @@ struct Inner {
     prepared: Mutex<Option<PreparedJob>>,
     handoff: Mutex<Option<PreparedJob>>,
     shutdown: watch::Sender<bool>,
-    manual_release: Mutex<Option<ManualRelease>>,
+    manual_release: Mutex<Option<(String, ManualRelease)>>,
 }
 
 /// Cloneable update operations and durable polling snapshots. It creates no
@@ -73,6 +74,7 @@ impl UpdateManager {
         let client = config.client()?;
         let store = Directory::private(&config.updates_directory)?;
         store.bind_product(&config.build.product_id)?;
+        let channels = ChannelStore::open(store.as_path(), config.source.clone())?;
         let server_lock = if config.mode == InstallationMode::External {
             None
         } else {
@@ -94,6 +96,7 @@ impl UpdateManager {
         let manager = Self(Arc::new(Inner {
             config,
             client,
+            channels,
             store,
             layout,
             supervisor,
@@ -154,7 +157,38 @@ impl UpdateManager {
     /// Read persistent state. Reconcile abandoned preparation without touching data.
     pub fn status(&self) -> Result<OperationStatus> {
         self.reconcile_interrupted()?;
-        self.0.store.status()
+        let checked = self.0.store.stored_check()?;
+        let status = checked.status;
+        let check_only = matches!(status.state, Stage::Idle | Stage::Available)
+            || status.state == Stage::Failed && !checked.check_source_id.is_empty();
+        if check_only
+            && !status.recovery_required
+            && status.operation_id.is_some()
+            && checked.check_source_id != self.channels().active_source()?.fingerprint()?
+        {
+            return Ok(OperationStatus::default());
+        }
+        Ok(status)
+    }
+
+    /// Manage the user's manifest channels in the runtime's private directory.
+    /// The next check reads the current selection. A prepared operation retains its verified bytes.
+    pub fn channels(&self) -> &ChannelStore {
+        &self.0.channels
+    }
+
+    fn selected_client(&self) -> Result<UpdateClient> {
+        let source = self.channels().active_source()?;
+        if source.manifest_url == self.0.config.source.manifest_url
+            && source.descriptor_url == self.0.config.source.descriptor_url
+        {
+            return Ok(self.0.client.clone());
+        }
+        UpdateClient::new(
+            source,
+            &self.0.config.build.version,
+            &self.0.config.build.protocol_target()?,
+        )
     }
 
     /// Last manifest download hint, kept only in memory. The URL may contain
@@ -162,12 +196,15 @@ impl UpdateManager {
     /// After a restart, check again to obtain a fresh hint. This does not grant
     /// permission to install an unsigned artifact.
     pub fn manual_release(&self) -> Result<Option<ManualRelease>> {
+        let source_id = self.channels().active_source()?.fingerprint()?;
         Ok(self
             .0
             .manual_release
             .lock()
             .map_err(|_| UpdateError::Worker)?
-            .clone())
+            .as_ref()
+            .filter(|(id, _)| id == &source_id)
+            .map(|(_, release)| release.clone()))
     }
 
     /// Read diagnostics suitable for a polling or SSE adapter.
@@ -194,13 +231,15 @@ impl UpdateManager {
     pub fn check(&self) -> Result<OperationStatus> {
         let store = &self.0.store;
         let lock = store.lock("operation.lock")?;
-        let previous = store.status()?;
+        let checked = store.stored_check()?;
+        let previous = checked.status;
         if previous.recovery_required {
             return Err(UpdateError::Unsupported("offline recovery required"));
         }
         if previous.state.busy() {
             return Err(UpdateError::Busy);
         }
+        let client = self.selected_client()?;
         *self
             .0
             .manual_release
@@ -210,20 +249,25 @@ impl UpdateManager {
             operation_id: Some(operation_id()?),
             state: Stage::Checking,
             message: "Checking signed release".into(),
-            last_checked: previous.last_checked,
+            last_checked: previous
+                .last_checked
+                .filter(|_| checked.check_source_id == client.source_id),
             ..Default::default()
         };
-        store.save_status(&mut status)?;
+        store.save_check(&mut status, &client.source_id)?;
         let initial = status.clone();
         let manager = self.clone();
         tokio::spawn(async move {
             let _lock = lock;
-            let result = manager.0.client.check().await;
+            let result = client.check().await;
             status.last_checked = Some(now());
             match result {
                 Ok(result) => {
                     if let Ok(mut manual) = manager.0.manual_release.lock() {
-                        *manual = result.manual.clone();
+                        *manual = result
+                            .manual
+                            .clone()
+                            .map(|release| (client.source_id.clone(), release));
                     }
                     status.manual_release = result.manual.map(|r| ManualReleaseInfo {
                         version: r.version,
@@ -254,7 +298,7 @@ impl UpdateManager {
                 Err(error) => mark_failed(&mut status, &error),
             }
             // Persistence failures are visible through status() as abandoned work.
-            let _ = manager.0.store.save_status(&mut status);
+            let _ = manager.0.store.save_check(&mut status, &client.source_id);
         });
         Ok(initial)
     }
@@ -265,7 +309,8 @@ impl UpdateManager {
     pub fn prepare(&self, request: InstallRequest) -> Result<OperationStatus> {
         let store = &self.0.store;
         let lock = store.lock("operation.lock")?;
-        let mut status = store.status()?;
+        let checked = store.stored_check()?;
+        let mut status = checked.status;
         if status.operation_id.as_deref() != Some(&request.check_id)
             || status
                 .available
@@ -274,6 +319,10 @@ impl UpdateManager {
             || status.state != Stage::Available
             || status.recovery_required
         {
+            return Err(UpdateError::Stale);
+        }
+        let client = self.selected_client()?;
+        if checked.check_source_id != client.source_id {
             return Err(UpdateError::Stale);
         }
         if !self.summary()?.installation_supported {
@@ -291,7 +340,7 @@ impl UpdateManager {
         let manager = self.clone();
         tokio::spawn(async move {
             let _lock = lock;
-            match manager.prepare_job(&mut status).await {
+            match manager.prepare_job(&client, &mut status).await {
                 Ok(job) => match manager.0.prepared.lock() {
                     Ok(mut prepared) => *prepared = Some(job),
                     Err(_) => {
@@ -318,16 +367,14 @@ impl UpdateManager {
         Ok(initial)
     }
 
-    async fn prepare_job(&self, status: &mut OperationStatus) -> Result<PreparedJob> {
+    async fn prepare_job(
+        &self,
+        client: &UpdateClient,
+        status: &mut OperationStatus,
+    ) -> Result<PreparedJob> {
         let store = &self.0.store;
         let config = &self.0.config;
-        let update = self
-            .0
-            .client
-            .check()
-            .await?
-            .update
-            .ok_or(UpdateError::Stale)?;
+        let update = client.check().await?.update.ok_or(UpdateError::Stale)?;
         let selected = status.available.as_ref().ok_or(UpdateError::Stale)?;
         let metadata = update.metadata();
         if selected.version != metadata.version
@@ -364,9 +411,7 @@ impl UpdateManager {
         let file = layout.staging.create(&job.part())?;
         files::allocate(&file, metadata.size_bytes)?;
         let mut saved = Instant::now();
-        let file = self
-            .0
-            .client
+        let file = client
             .download(&update, file, |event| {
                 match event {
                     DownloadEvent::Progress { downloaded, total } => {

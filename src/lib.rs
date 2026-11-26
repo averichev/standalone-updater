@@ -4,6 +4,7 @@
 //! [`VerifiedUpdate`] can only be created by successful verification of signed
 //! metadata from a manifest artifact or a legacy descriptor endpoint. Unsigned
 //! manifest entries can supply manual download hints.
+//! [`ChannelStore`] saves user-selected manifest URLs under the application's pinned key.
 //!
 //! Enable `linux-runtime` for the `runtime` module on Linux. See the repository's
 //! `examples/axum-service.rs` for graceful shutdown, readiness and process dispatch.
@@ -23,10 +24,13 @@
 //! ```
 #![warn(missing_docs)]
 mod artifact;
+mod channels;
 mod client;
+mod local_state;
 mod models;
 mod monitor;
 mod monitor_cache;
+pub use channels::{ChannelInfo, ChannelStore, DEFAULT_CHANNEL};
 pub use monitor::{CheckSummary, UpdateMonitor};
 
 #[cfg(all(feature = "linux-runtime", target_os = "linux"))]

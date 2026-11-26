@@ -23,6 +23,7 @@ pub struct UpdateClient {
     download_client: Client,
     key: VerifyingKey,
     key_id: String,
+    pub(crate) source_id: String,
 }
 
 /// Stream download events. Bytes are actual received bytes.
@@ -62,7 +63,7 @@ fn decode(value: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn parse_url(value: &str) -> Result<Url> {
+pub(crate) fn parse_url(value: &str) -> Result<Url> {
     if value.len() > 8192 {
         return Err(UpdateError::Trust("URL превышает локальный лимит"));
     }
@@ -143,7 +144,7 @@ pub fn canonical_version(value: &str) -> Result<Version> {
     Ok(version)
 }
 
-fn product_id(value: &str) -> bool {
+pub(crate) fn valid_product_id(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(i, b)| {
             if [8, 13, 18, 23].contains(&i) {
@@ -157,7 +158,7 @@ fn product_id(value: &str) -> bool {
 impl UpdateClient {
     /// Construct a client; validates configuration without network access.
     pub fn new(source: UpdateSource, current_version: &str, target: &str) -> Result<Self> {
-        if !product_id(&source.product_id)
+        if !valid_product_id(&source.product_id)
             || !matches!(
                 target,
                 "linux-x86_64"
@@ -208,6 +209,7 @@ impl UpdateClient {
             .map_err(|_| UpdateError::Trust("неверный публичный ключ"))?;
         let canonical = format!(r#"{{"crv":"Ed25519","kty":"OKP","x":"{}"}}"#, jwk.x);
         let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()));
+        let source_id = source.fingerprint()?;
         Ok(Self {
             current: canonical_version(current_version)?,
             target: target.into(),
@@ -220,6 +222,7 @@ impl UpdateClient {
             source,
             key,
             key_id,
+            source_id,
         })
     }
 

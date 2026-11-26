@@ -40,11 +40,15 @@ impl UpdateMonitor {
         })
     }
     /// Retain redacted check results in a dedicated process-owned directory.
-    /// This cache is bound to product/key/version/target, contains no download
+    /// This cache is bound to source policy, product, version and target, contains no download
     /// URLs and never accepts installation/recovery state. No network is used.
     /// Existing symlinks or unsafe permissions are rejected, not repaired.
     pub fn with_cache(mut self, directory: &std::path::Path) -> Result<Self> {
-        let cache = crate::monitor_cache::Cache::open(directory, self.identity.clone())?;
+        let cache = crate::monitor_cache::Cache::open(
+            directory,
+            self.identity.clone(),
+            self.client.source_id.clone(),
+        )?;
         let status = cache.load()?;
         *self.snapshot.lock().map_err(|_| UpdateError::Worker)? = (status, None);
         self.cache = Some(cache);

@@ -34,6 +34,24 @@ pub struct UpdateSource {
 }
 
 impl UpdateSource {
+    // Bind cached checks to the complete source policy without retaining its URLs.
+    pub(crate) fn fingerprint(&self) -> crate::Result<String> {
+        use sha2::{Digest, Sha256};
+        let mut origins = self.allowed_download_origins.iter().collect::<Vec<_>>();
+        origins.sort_unstable();
+        origins.dedup();
+        let policy = serde_json::to_vec(&(
+            &self.product_id,
+            &self.manifest_url,
+            &self.descriptor_url,
+            &self.public_key,
+            origins,
+            self.max_artifact_bytes,
+        ))
+        .map_err(|_| crate::UpdateError::Document)?;
+        Ok(crate::hex(&Sha256::digest(policy)))
+    }
+
     /// Configure a channel with one manifest URL and the application's pinned trust and limits.
     pub fn from_manifest(
         manifest_url: impl Into<String>,
@@ -240,6 +258,24 @@ pub struct OperationStatus {
     pub recovery_required: bool,
     /// PID plus Linux start time of the operation owner.
     pub worker: Option<ProcessIdentity>,
+}
+
+/// A persisted check and its source binding. Older snapshots deserialize with an empty binding.
+#[derive(Default, Serialize, Deserialize)]
+pub(crate) struct StoredCheck {
+    #[serde(flatten)]
+    pub status: OperationStatus,
+    #[serde(default)]
+    pub check_source_id: String,
+}
+
+impl StoredCheck {
+    pub fn new(status: &OperationStatus, source_id: &str) -> Self {
+        Self {
+            status: status.clone(),
+            check_source_id: source_id.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
